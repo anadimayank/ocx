@@ -1,0 +1,12 @@
+{
+	"mcpServers": {
+		"context7": {
+			"url": "https://mcp.context7.com/mcp",
+			"type": "http",
+      "env": {},
+      "description": "Context7 MCP server for OpenShift documentation"
+		}
+	},
+  "defaultTimeout": 30000,
+  "retryAttempts": 3
+}
