@@ -1,24 +1,25 @@
 {
-  "name": "openshift-ai-assistant",
-  "displayName": "OpenShift AI Assistant",
-  "description": "AI-powered assistant for Red Hat OpenShift with GitHub Copilot Chat integration",
-  "version": "2.0.0",
+  "name": "ocx-ai-assistant",
+  "displayName": "ocX AI Assistant",
+  "description": "Your universal AI assistant for technical documentation and code, integrated with Copilot Chat.",
+  "version": "3.0.0",
   "publisher": "your-publisher-name",
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
     "AI",
-    "Chat Participants",
-    "Other"
+    "Chat",
+    "Education"
   ],
   "keywords": [
-    "openshift",
-    "kubernetes",
-    "redhat",
-    "copilot",
+    "documentation",
     "ai",
-    "chat"
+    "copilot",
+    "chat",
+    "devops",
+    "kubernetes",
+    "openshift"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -27,46 +28,24 @@
   "contributes": {
     "chatParticipants": [
       {
-        "id": "openshift-ai-assistant.ocX",
+        "id": "ocx-ai-assistant.ocX",
         "name": "ocX",
-        "description": "OpenShift AI Assistant - Get help with OpenShift, Kubernetes, and Red Hat technologies",
+        "description": "Get expert help with documentation, code explanations, and more.",
         "isSticky": true,
         "commands": [
           {
-            "name": "troubleshoot",
-            "description": "Debug OpenShift issues and errors"
-          },
-          {
             "name": "docs",
-            "description": "Get OpenShift documentation and API references"
+            "description": "Fetch documentation for any technology (e.g., /docs nodejs http module)"
           },
           {
             "name": "search",
-            "description": "Search Stack Overflow for community solutions"
+            "description": "Search Stack Overflow for community answers"
           },
           {
             "name": "explain",
-            "description": "Explain selected OpenShift YAML or code"
-          },
-          {
-            "name": "best-practices",
-            "description": "Get OpenShift best practices and recommendations"
+            "description": "Explain the selected code snippet"
           }
         ]
-      }
-    ],
-    "commands": [
-      {
-        "command": "openshift-ai-assistant.askQuestion",
-        "title": "Ask OpenShift Question",
-        "category": "OpenShift AI"
-      }
-    ],
-    "keybindings": [
-      {
-        "command": "openshift-ai-assistant.askQuestion",
-        "key": "ctrl+shift+o",
-        "mac": "cmd+shift+o"
       }
     ]
   },
@@ -90,7 +69,6 @@
     "@vscode/vsce": "^2.19.0"
   },
   "dependencies": {
-    "ws": "^8.13.0",
-    "axios": "^1.4.0"
+    "ws": "^8.13.0"
   }
 }

@@ -1,0 +1,31 @@
+# Build output
+out/
+dist/
+
+# Dependencies
+node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# VS Code specific files
+.vscode-test/
+
+# Environment files
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Package files
+*.vsix
+
+# Mac OS files
+.DS_Store
+
+# Windows files
+Thumbs.db

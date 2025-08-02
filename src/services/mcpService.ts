@@ -1,146 +1,201 @@
 import * as vscode from 'vscode';
-import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as https from 'https';
 import { MCPRequest, MCPResponse, DocumentationResult } from '../types';
 
-export class MCPService implements vscode.Disposable {
-    private mcpProcess: cp.ChildProcess | null = null;
-    private isConnected = false;
-    private requestIdCounter = 0;
-    private disposed = false;
-    private pendingRequests = new Map<
-        string,
-        {
-            resolve: (value: MCPResponse) => void;
-            reject: (error: any) => void;
-            timeout: NodeJS.Timeout;
-        }
-    >();
+// Interface for the structure of mcp.json
+interface McpConfig {
+    mcpServers: {
+        [key: string]: {
+            url: string;
+            type: 'http' | 'stdio';
+        };
+    };
+    defaultTimeout: number;
+    retryAttempts: number;
+}
 
-    private readonly REQUEST_TIMEOUT = 30000; // 30 seconds timeout
+/**
+ * Manages interaction with the MCP server for documentation retrieval.
+ * This service implements the correct two-step process:
+ * 1. Resolve a library name (e.g., "openshift") into a Context7 ID.
+ * 2. Use the ID to fetch documentation for a specific topic.
+ */
+export class MCPService implements vscode.Disposable {
+    private config: McpConfig;
+    private serverUrl: URL;
 
     constructor(private context: vscode.ExtensionContext) {
-        this.initializeConnection();
+        this.config = this.loadConfiguration();
+        this.serverUrl = new URL(this.config.mcpServers.context7.url);
     }
 
-    private initializeConnection(): void {
-        if (this.disposed || this.mcpProcess) {
-            // Prevent multiple initializations
-            return;
-        }
-
+    /**
+     * Loads and parses the mcp.json configuration file from the extension's root directory.
+     * @returns The parsed configuration object.
+     */
+    private loadConfiguration(): McpConfig {
+        const configPath = path.join(this.context.extensionPath, 'mcp.json');
         try {
-            const command = 'npx';
-            const args = ['-y', '@upstash/context7-mcp'];
+            if (fs.existsSync(configPath)) {
+                const rawConfig = fs.readFileSync(configPath, 'utf-8');
+                console.log('[MCPService] Successfully loaded mcp.json configuration.');
+                return JSON.parse(rawConfig);
+            }
+        } catch (error) {
+            console.error('[MCPService] Error reading or parsing mcp.json:', error);
+        }
+        // Fallback to a default configuration if the file is missing or invalid.
+        vscode.window.showErrorMessage('Could not load mcp.json. Using default MCP configuration.');
+        return {
+            mcpServers: {
+                context7: { url: 'https://mcp.context7.com/mcp', type: 'http' }
+            },
+            defaultTimeout: 30000,
+            retryAttempts: 3
+        };
+    }
 
-            console.log(`[MCPService] Spawning MCP server: ${command} ${args.join(' ')}`);
+    /**
+     * The main public method to fetch documentation. It orchestrates the two-step process.
+     * @param technology The library/technology name (e.g., 'openshift').
+     * @param query The specific topic or query.
+     * @returns A promise that resolves to an array of documentation results.
+     */
+    async getDocumentation(technology: string, query: string): Promise<DocumentationResult[]> {
+        try {
+            let effectiveTechnology = technology;
 
-            this.mcpProcess = cp.spawn(command, args, {
-                stdio: ['pipe', 'pipe', 'pipe'],
-                shell: true,
-                cwd: this.context.extensionPath,
-            });
-
-            this.isConnected = true;
-            console.log('[MCPService] MCP process spawned.');
-
-            // Buffer for stdout data to handle partial JSON lines
-            let responseBuffer = '';
-
-            this.mcpProcess.stdout!.on('data', (data: Buffer) => {
-                if (this.disposed) return;
-
-                const chunk = data.toString();
-                responseBuffer += chunk;
-
-                // Log raw stdout chunk (can be verbose; consider removing in production)
-                console.log(`[MCPService] MCP stdout chunk received: ${chunk.trim()}`);
-
-                // Process complete lines (assuming each line is a JSON message)
-                let newlineIndex;
-                while ((newlineIndex = responseBuffer.indexOf('\n')) !== -1) {
-                    const line = responseBuffer.substring(0, newlineIndex).trim();
-                    responseBuffer = responseBuffer.substring(newlineIndex + 1);
-
-                    if (line.length === 0) continue;
-
-                    try {
-                        const response: MCPResponse = JSON.parse(line);
-                        this.handleResponse(response);
-                    } catch (err) {
-                        console.error('[MCPService] Failed to parse MCP stdout line:', line, err);
+            // Heuristic to correct a misidentified technology name. If a generic term
+            // like "latest" is passed as the technology, scan the query for a known tech keyword.
+            if (['latest', 'version', 'current'].includes(technology.toLowerCase())) {
+                const knownTechs = ['openshift', 'kubernetes', 'python', 'go', 'rust', 'react', 'behat', 'mongo', 'next.js'];
+                const queryWords = query.toLowerCase().split(' ');
+                
+                for (const tech of knownTechs) {
+                    if (queryWords.includes(tech)) {
+                        effectiveTechnology = tech;
+                        console.log(`[MCPService] Corrected technology from "${technology}" to "${effectiveTechnology}" based on query.`);
+                        break; // Use the first match
                     }
                 }
-            });
+            }
 
-            this.mcpProcess.stderr!.on('data', (data: Buffer) => {
-                const errMsg = data.toString().trim();
-                if (errMsg.length > 0) {
-                    console.warn(`[MCPService] MCP process stderr: ${errMsg}`);
-                }
-            });
+            console.log(`[MCPService] Starting documentation fetch for technology: "${effectiveTechnology}"`);
+            // Step 1: Resolve the library name into a Context7-compatible ID.
+            const libraryId = await this.resolveLibraryId(effectiveTechnology);
+            console.log(`[MCPService] Resolved library ID: "${libraryId}"`);
 
-            this.mcpProcess.on('exit', (code: number | null) => {
-                if (this.disposed) return;
+            // Step 2: Use the resolved ID to fetch the actual documentation.
+            const docContent = await this.fetchDocsForLibrary(libraryId, query);
+            
+            // Step 3: Parse and return the final results.
+            return this.parseDocumentation(docContent);
 
-                console.log(`[MCPService] MCP process exited with code ${code}`);
-                this.isConnected = false;
-                this.mcpProcess = null;
-
-                // Reject any pending requests as MCP process is down
-                this.rejectPendingRequests('MCP process exited unexpectedly');
-
-                // Attempt to restart MCP process after delay
-                setTimeout(() => {
-                    if (!this.disposed) {
-                        this.initializeConnection();
-                    }
-                }, 5000);
-            });
-
-            this.mcpProcess.on('error', (error: Error) => {
-                if (this.disposed) return;
-
-                console.error('[MCPService] Error starting MCP process:', error);
-                this.isConnected = false;
-                this.mcpProcess = null;
-                this.rejectPendingRequests(`MCP process failed to start: ${error.message}`);
-            });
-        } catch (e) {
-            console.error('[MCPService] Unexpected error during MCP process initialization:', e);
+        } catch (error) {
+            console.error(`[MCPService] Failed to get documentation for "${technology}" - "${query}":`, error);
+            throw error; // Re-throw for the provider to handle.
         }
     }
 
     /**
-     * Request live documentation from MCP server.
-     * @param query The search query string.
-     * @returns Promise resolving to an array of DocumentationResult.
+     * Step 1: Calls the 'resolve-library-id' tool on the MCP server.
+     * This now parses the text response to find the best matching library ID.
+     * @param libraryName The name of the library to resolve.
+     * @returns A promise that resolves to the Context7-compatible library ID.
      */
-    async getDocumentation(query: string): Promise<DocumentationResult[]> {
-        if (!this.isConnected || !this.mcpProcess) {
-            throw new Error('MCP server is not connected or process is not running.');
-        }
-
+    private async resolveLibraryId(libraryName: string): Promise<string> {
         const request: MCPRequest = {
+            jsonrpc: '2.0',
             method: 'tools/call',
             params: {
-                name: 'search-documentation',
-                arguments: { query, source: 'openshift', version: 'latest' },
+                name: 'resolve-library-id',
+                arguments: { libraryName },
             },
-            id: this.generateRequestId(),
+            id: `req_resolve_${Date.now()}`,
         };
 
-        const response = await this.sendRequest(request);
+        const response = await this.sendHttpRequest(request);
 
-        if (!response.result || !response.result.content) {
-            // Return empty array if no content found
-            return [];
+        if (response.error) {
+            throw new Error(response.error.message);
+        }
+        if (!response.result || !response.result.content || !Array.isArray(response.result.content) || response.result.content.length === 0) {
+            throw new Error(`Could not resolve library ID for "${libraryName}". No content returned.`);
+        }
+        
+        // The server returns a text block within the first element of the content array.
+        const responseText = response.result.content[0]?.text;
+        if (typeof responseText !== 'string') {
+            throw new Error('Invalid response format from resolve-library-id tool.');
         }
 
-        const docContent = response.result.content;
+        // Regex to find library entries and extract their title and ID.
+        const libraryRegex = /- Title: (.*?)\n- Context7-compatible library ID: (.*?)\n/g;
+        let match;
+        const libraries = [];
+        while ((match = libraryRegex.exec(responseText)) !== null) {
+            libraries.push({ title: match[1], id: match[2] });
+        }
 
-        // Helper to process doc item into DocumentationResult
+        if (libraries.length === 0) {
+            throw new Error(`No libraries found in the response for "${libraryName}".`);
+        }
+
+        // Find the first library whose title includes the requested library name (case-insensitive).
+        const lowerCaseLibraryName = libraryName.toLowerCase();
+        const foundLibrary = libraries.find(lib => lib.title.toLowerCase().includes(lowerCaseLibraryName));
+
+        if (!foundLibrary) {
+            throw new Error(`Could not find a matching library for "${libraryName}" in the server's response.`);
+        }
+
+        return foundLibrary.id;
+    }
+
+    /**
+     * Step 2: Calls the 'get-library-docs' tool on the MCP server.
+     * @param libraryId The Context7-compatible library ID.
+     * @param topic The specific query/topic for the documentation.
+     * @returns A promise that resolves to the documentation content.
+     */
+    private async fetchDocsForLibrary(libraryId: string, topic: string): Promise<any> {
+        const request: MCPRequest = {
+            jsonrpc: '2.0',
+            method: 'tools/call',
+            params: {
+                name: 'get-library-docs',
+                arguments: {
+                    context7CompatibleLibraryID: libraryId,
+                    topic: topic,
+                },
+            },
+            id: `req_fetch_${Date.now()}`,
+        };
+
+        const response = await this.sendHttpRequest(request);
+
+        if (response.error) {
+            throw new Error(response.error.message);
+        }
+        if (!response.result || !response.result.content) {
+            console.log(`[MCPService] No documentation content found for topic: "${topic}"`);
+            return null;
+        }
+        return response.result.content;
+    }
+
+    /**
+     * Parses the final documentation content into a structured format.
+     * @param docContent The content returned from the 'get-library-docs' tool.
+     * @returns An array of DocumentationResult objects.
+     */
+    private parseDocumentation(docContent: any): DocumentationResult[] {
+        if (!docContent) return [];
+
         const toDocResult = (doc: any): DocumentationResult => ({
-            title: doc.title || 'OpenShift Documentation',
+            title: doc.title || 'Documentation',
             content: doc.text || doc.content || '',
             source: 'Context7 MCP',
             version: doc.version || 'latest',
@@ -152,115 +207,70 @@ export class MCPService implements vscode.Disposable {
         } else if (typeof docContent === 'object' && docContent !== null) {
             return [toDocResult(docContent)];
         }
-
         return [];
     }
 
     /**
-     * Send a JSON-RPC request to MCP process via stdin.
-     * @param request MCPRequest object.
-     * @returns Promise resolving to MCPResponse.
+     * Sends a JSON-RPC request to the configured MCP server URL using Node's native https module.
+     * @param request The MCPRequest to send.
+     * @returns A promise that resolves with the MCPResponse.
      */
-    private sendRequest(request: MCPRequest): Promise<MCPResponse> {
-        return new Promise((resolve, reject) => {
-            if (!this.mcpProcess || !this.mcpProcess.stdin || !this.isConnected) {
-                return reject(new Error('MCP server process is not available.'));
+    private sendHttpRequest(request: MCPRequest): Promise<MCPResponse> {
+        const postData = JSON.stringify(request);
+        const options = {
+            hostname: this.serverUrl.hostname,
+            path: this.serverUrl.pathname,
+            method: 'POST',
+            timeout: this.config.defaultTimeout,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData),
+                'Accept': 'application/json, text/event-stream',
+                'User-Agent': 'Node.js-https'
             }
+        };
 
-            const requestId = request.id || this.generateRequestId();
-            request.id = requestId;
+        console.log(`[MCPService] Sending native HTTPS request to ${this.serverUrl.href} for tool: ${request.params.name}`);
 
-            const timeout = setTimeout(() => {
-                this.pendingRequests.delete(requestId);
-                reject(new Error(`Request to MCP server timed out (id: ${requestId}).`));
-            }, this.REQUEST_TIMEOUT);
-
-            this.pendingRequests.set(requestId, { resolve, reject, timeout });
-
-            const payload = JSON.stringify(request) + '\n';
-
-            console.log(`[MCPService] Sending request to MCP stdin: ${payload.trim()}`);
-
-            // Write request payload to MCP stdin
-            this.mcpProcess.stdin.write(payload, (error) => {
-                if (error) {
-                    clearTimeout(timeout);
-                    this.pendingRequests.delete(requestId);
-                    reject(new Error(`Failed to write to MCP process stdin: ${error.message}`));
-                }
+        return new Promise((resolve, reject) => {
+            const req = https.request(options, (res) => {
+                let responseBody = '';
+                res.setEncoding('utf8');
+                res.on('data', (chunk) => { responseBody += chunk; });
+                res.on('end', () => {
+                    console.log(`[MCPService] Received HTTP response with status: ${res.statusCode}`);
+                    console.log(`[MCPService] Raw response body:`, responseBody);
+                    
+                    if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                        try {
+                            const jsonStartIndex = responseBody.indexOf('{');
+                            if (jsonStartIndex === -1) {
+                                throw new Error('No JSON object found in the server response.');
+                            }
+                            const jsonString = responseBody.substring(jsonStartIndex);
+                            const parsedResponse = JSON.parse(jsonString);
+                            resolve(parsedResponse);
+                        } catch (e) {
+                            reject(new Error(`Failed to parse JSON response. Error: ${e instanceof Error ? e.message : 'Unknown'}`));
+                        }
+                    } else {
+                        reject(new Error(`Server responded with status code ${res.statusCode}. Body: ${responseBody}`));
+                    }
+                });
             });
+
+            req.on('error', (e) => reject(new Error(`HTTPS request failed: ${e.message}`)));
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error(`Request timed out after ${this.config.defaultTimeout}ms.`));
+            });
+
+            req.write(postData);
+            req.end();
         });
     }
-
-    /**
-     * Handle MCP server JSON-RPC responses from stdout.
-     * Matches response with pending requests by request ID.
-     * @param response MCPResponse object.
-     */
-    private handleResponse(response: MCPResponse): void {
-        const requestId = response.id;
-        if (!requestId) {
-            console.warn('[MCPService] Received MCP response without an ID:', response);
-            return;
-        }
-
-        const pending = this.pendingRequests.get(requestId);
-        if (!pending) {
-            console.warn(`[MCPService] No pending request found for response ID: ${requestId}`);
-            return;
-        }
-
-        // Clear timeout and remove from pending
-        clearTimeout(pending.timeout);
-        this.pendingRequests.delete(requestId);
-
-        if (response.error) {
-            pending.reject(new Error(response.error.message));
-        } else {
-            pending.resolve(response);
-        }
-    }
-
-    /**
-     * Reject all pending MCP requests, e.g. on process exit.
-     * @param reason Reason for rejection.
-     */
-    private rejectPendingRequests(reason: string): void {
-        for (const [, { reject, timeout }] of this.pendingRequests) {
-            clearTimeout(timeout);
-            reject(new Error(reason));
-        }
-        this.pendingRequests.clear();
-    }
-
-    /**
-     * Generate unique request ID string for MCP requests.
-     */
-    private generateRequestId(): string {
-        return `req_${++this.requestIdCounter}_${Date.now()}`;
-    }
-
-    /**
-     * Check if MCP service is available.
-     */
-    isServiceAvailable(): boolean {
-        return this.isConnected && this.mcpProcess !== null;
-    }
-
-    /**
-     * Dispose MCP service, terminate MCP process and reject pending requests.
-     */
+    
     dispose(): void {
-        this.disposed = true;
-
-        this.rejectPendingRequests('MCP service is disposed');
-
-        if (this.mcpProcess) {
-            console.log('[MCPService] Killing MCP process.');
-            this.mcpProcess.kill();
-            this.mcpProcess = null;
-        }
-
-        this.isConnected = false;
+        // Nothing to dispose.
     }
 }
