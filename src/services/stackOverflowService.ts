@@ -1,308 +1,97 @@
-import * as vscode from 'vscode';
 import axios from 'axios';
-import { StackOverflowQuestion, StackOverflowAnswer, PythonServiceResponse } from '../types';
+import { StackOverflowQuestion } from '../types';
 
+/**
+ * A service for interacting with the Stack Exchange API to search for
+ * Stack Overflow questions. It does not require an API key for basic searches.
+ */
 export class StackOverflowService {
-    private readonly BASE_URL = 'https://api.stackexchange.com/2.3';
-    private readonly SITE = 'stackoverflow';
-    private readonly PAGE_SIZE = 10;
-    private readonly REQUEST_DELAY = 1000; // Rate limiting
-    private lastRequestTime = 0;
+    private readonly baseUrl = 'https://api.stackexchange.com/2.3';
 
-    constructor() {}
+    /**
+     * Searches Stack Overflow for questions related to OpenShift.
+     * @param query The user's search query.
+     * @param limit The maximum number of results to return.
+     * @returns A promise that resolves to an array of StackOverflowQuestion objects.
+     */
+    async searchOpenShiftQuestions(query: string, limit: number = 5): Promise<StackOverflowQuestion[]> {
+        const params = new URLSearchParams({
+            order: 'desc',
+            sort: 'relevance',
+            // Use the 'tagged' parameter for more accurate tag-based searching.
+            tagged: 'openshift',
+            // Use the 'intitle' parameter to search for the query within the question title,
+            // which provides more relevant results than a full-text search ('q').
+            intitle: query,
+            site: 'stackoverflow',
+            pagesize: limit.toString(),
+        });
 
-    async searchQuestions(query: string, limit: number = 5): Promise<StackOverflowQuestion[]> {
+        const url = `${this.baseUrl}/search/advanced?${params}`;
+        console.log(`[StackOverflowService] Searching with URL: ${url}`);
+
         try {
-            // Rate limiting
-            await this.ensureRateLimit();
+            const response = await axios.get(url, { timeout: 10000 });
 
-            const searchParams = new URLSearchParams({
-                order: 'desc',
-                sort: 'relevance',
-                q: query,
-                site: this.SITE,
-                pagesize: Math.min(limit, this.PAGE_SIZE).toString(),
-                filter: 'withbody'
-            });
-
-            const url = `${this.BASE_URL}/search/advanced?${searchParams}`;
-            const response = await axios.get(url, {
-                timeout: 10000,
-                headers: {
-                    'User-Agent': 'OpenShift-AI-Assistant/2.0.0'
-                }
-            });
-
-            if (!response.data || !response.data.items) {
+            if (!response.data || !Array.isArray(response.data.items)) {
                 return [];
             }
 
-            const questions: StackOverflowQuestion[] = response.data.items.map((item: any) => ({
+            // Map the API response to our custom type.
+            return response.data.items.map((item: any): StackOverflowQuestion => ({
                 question_id: item.question_id,
-                title: item.title,
+                title: this.decodeHtmlEntities(item.title),
                 score: item.score,
                 answer_count: item.answer_count,
                 tags: item.tags || [],
-                creation_date: item.creation_date,
-                last_activity_date: item.last_activity_date,
-                is_answered: item.is_answered,
-                accepted_answer_id: item.accepted_answer_id,
                 link: item.link,
-                body: this.cleanHtml(item.body || '')
+                is_answered: item.is_answered,
+                creation_date: item.creation_date,
+                last_activity_date: item.last_activity_date
             }));
 
-            // Fetch answers for top questions
-            const questionsWithAnswers = await this.fetchAnswersForQuestions(questions.slice(0, 3));
-
-            return questionsWithAnswers;
-
         } catch (error) {
-            console.error('Error searching Stack Overflow:', error);
             if (axios.isAxiosError(error)) {
-                if (error.response?.status === 429) {
-                    throw new Error('Rate limit exceeded. Please try again later.');
-                }
-                if (error.response?.status === 400) {
-                    throw new Error('Invalid search query. Please refine your search terms.');
-                }
+                console.error(`[StackOverflowService] API Error: ${error.message}`, error.response?.data);
+            } else {
+                console.error(`[StackOverflowService] Generic Error:`, error);
             }
-            throw new Error(`Failed to search Stack Overflow: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            // Re-throw to be handled by the chat provider.
+            throw new Error('Failed to retrieve search results from Stack Overflow.');
         }
     }
 
-    async getQuestionById(questionId: number): Promise<StackOverflowQuestion | null> {
-        try {
-            await this.ensureRateLimit();
-
-            const url = `${this.BASE_URL}/questions/${questionId}`;
-            const params = new URLSearchParams({
-                site: this.SITE,
-                filter: 'withbody'
-            });
-
-            const response = await axios.get(`${url}?${params}`, {
-                timeout: 10000
-            });
-
-            if (!response.data || !response.data.items || response.data.items.length === 0) {
-                return null;
-            }
-
-            const item = response.data.items[0];
-            const question: StackOverflowQuestion = {
-                question_id: item.question_id,
-                title: item.title,
-                score: item.score,
-                answer_count: item.answer_count,
-                tags: item.tags || [],
-                creation_date: item.creation_date,
-                last_activity_date: item.last_activity_date,
-                is_answered: item.is_answered,
-                accepted_answer_id: item.accepted_answer_id,
-                link: item.link,
-                body: this.cleanHtml(item.body || '')
-            };
-
-            // Fetch answers for this question
-            const answers = await this.getAnswersForQuestion(questionId);
-            question.answers = answers;
-
-            return question;
-
-        } catch (error) {
-            console.error(`Error fetching question ${questionId}:`, error);
-            return null;
-        }
-    }
-
-    async getAnswersForQuestion(questionId: number): Promise<StackOverflowAnswer[]> {
-        try {
-            await this.ensureRateLimit();
-
-            const url = `${this.BASE_URL}/questions/${questionId}/answers`;
-            const params = new URLSearchParams({
-                site: this.SITE,
-                order: 'desc',
-                sort: 'votes',
-                filter: 'withbody',
-                pagesize: '5'
-            });
-
-            const response = await axios.get(`${url}?${params}`, {
-                timeout: 10000
-            });
-
-            if (!response.data || !response.data.items) {
-                return [];
-            }
-
-            return response.data.items.map((item: any) => ({
-                answer_id: item.answer_id,
-                score: item.score,
-                is_accepted: item.is_accepted || false,
-                creation_date: item.creation_date,
-                body: this.cleanHtml(item.body || '')
-            }));
-
-        } catch (error) {
-            console.error(`Error fetching answers for question ${questionId}:`, error);
-            return [];
-        }
-    }
-
-    async searchWithTags(tags: string[], query?: string, limit: number = 5): Promise<StackOverflowQuestion[]> {
-        try {
-            await this.ensureRateLimit();
-
-            const tagString = tags.join(';');
-            const params = new URLSearchParams({
-                order: 'desc',
-                sort: 'votes',
-                tagged: tagString,
-                site: this.SITE,
-                pagesize: Math.min(limit, this.PAGE_SIZE).toString(),
-                filter: 'withbody'
-            });
-
-            if (query) {
-                params.set('q', query);
-            }
-
-            const url = `${this.BASE_URL}/questions?${params}`;
-            const response = await axios.get(url, {
-                timeout: 10000
-            });
-
-            if (!response.data || !response.data.items) {
-                return [];
-            }
-
-            return response.data.items.map((item: any) => ({
-                question_id: item.question_id,
-                title: item.title,
-                score: item.score,
-                answer_count: item.answer_count,
-                tags: item.tags || [],
-                creation_date: item.creation_date,
-                last_activity_date: item.last_activity_date,
-                is_answered: item.is_answered,
-                accepted_answer_id: item.accepted_answer_id,
-                link: item.link,
-                body: this.cleanHtml(item.body || '')
-            }));
-
-        } catch (error) {
-            console.error('Error searching Stack Overflow with tags:', error);
-            throw new Error(`Failed to search with tags: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-
-    async getTopAnswersForTopic(topic: string): Promise<StackOverflowAnswer[]> {
-        try {
-            const questions = await this.searchQuestions(`${topic} openshift kubernetes`, 3);
-            const answers: StackOverflowAnswer[] = [];
-
-            for (const question of questions) {
-                const questionAnswers = await this.getAnswersForQuestion(question.question_id);
-                answers.push(...questionAnswers.slice(0, 2)); // Top 2 answers per question
-            }
-
-            // Sort by score and return top answers
-            return answers.sort((a, b) => b.score - a.score).slice(0, 5);
-
-        } catch (error) {
-            console.error('Error getting top answers:', error);
-            return [];
-        }
-    }
-
-    private async fetchAnswersForQuestions(questions: StackOverflowQuestion[]): Promise<StackOverflowQuestion[]> {
-        const questionsWithAnswers = await Promise.all(
-            questions.map(async (question) => {
-                try {
-                    const answers = await this.getAnswersForQuestion(question.question_id);
-                    return { ...question, answers };
-                } catch (error) {
-                    console.error(`Error fetching answers for question ${question.question_id}:`, error);
-                    return question;
-                }
-            })
-        );
-
-        return questionsWithAnswers;
-    }
-
-    private cleanHtml(html: string): string {
-        // Remove HTML tags and decode entities
-        return html
-            .replace(/<[^>]*>/g, '') // Remove HTML tags
+    /**
+     * A simple utility to decode common HTML entities found in titles.
+     * @param text The text to decode.
+     * @returns The decoded text.
+     */
+    private decodeHtmlEntities(text: string): string {
+        return text
             .replace(/&quot;/g, '"')
             .replace(/&amp;/g, '&')
             .replace(/&lt;/g, '<')
             .replace(/&gt;/g, '>')
-            .replace(/&#39;/g, "'")
-            .replace(/&nbsp;/g, ' ')
-            .trim();
+            .replace(/&#39;/g, "'");
     }
 
-    private async ensureRateLimit(): Promise<void> {
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-
-        if (timeSinceLastRequest < this.REQUEST_DELAY) {
-            const delay = this.REQUEST_DELAY - timeSinceLastRequest;
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-
-        this.lastRequestTime = Date.now();
-    }
-
-    async isServiceAvailable(): Promise<boolean> {
+    /**
+     * Tests the connection to the Stack Exchange API.
+     * @returns A promise that resolves to true if the connection is successful, otherwise false.
+     */
+    async testConnection(): Promise<boolean> {
+        const url = `${this.baseUrl}/info?site=stackoverflow`;
+        console.log('[StackOverflowService] Testing connection...');
         try {
-            const response = await axios.get(`${this.BASE_URL}/info?site=${this.SITE}`, {
-                timeout: 5000
-            });
-            return response.status === 200;
-        } catch {
+            const response = await axios.get(url, { timeout: 5000 });
+            if (response.status === 200 && response.data.items) {
+                console.log('[StackOverflowService] Connection successful.');
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error('[StackOverflowService] Connection test failed:', error);
             return false;
         }
-    }
-
-    buildOpenShiftQuery(userQuery: string): string {
-        const openShiftKeywords = ['openshift', 'kubernetes', 'k8s', 'redhat', 'container'];
-        const hasOpenShiftKeyword = openShiftKeywords.some(keyword => 
-            userQuery.toLowerCase().includes(keyword)
-        );
-
-        if (!hasOpenShiftKeyword) {
-            return `${userQuery} openshift kubernetes`;
-        }
-
-        return userQuery;
-    }
-
-    getRelevantTags(query: string): string[] {
-        const commonTags = ['openshift', 'kubernetes', 'docker', 'containers'];
-        const queryLower = query.toLowerCase();
-
-        const tags = [];
-
-        if (queryLower.includes('route') || queryLower.includes('ingress')) {
-            tags.push('routing', 'networking');
-        }
-        if (queryLower.includes('pod') || queryLower.includes('deployment')) {
-            tags.push('pod', 'deployment');
-        }
-        if (queryLower.includes('service')) {
-            tags.push('service', 'networking');
-        }
-        if (queryLower.includes('storage') || queryLower.includes('volume')) {
-            tags.push('storage', 'persistent-volumes');
-        }
-        if (queryLower.includes('security') || queryLower.includes('rbac')) {
-            tags.push('security', 'authentication');
-        }
-
-        return [...new Set([...commonTags, ...tags])];
     }
 }

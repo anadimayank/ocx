@@ -4,9 +4,8 @@ import { MCPService } from '../services/mcpService';
 import { StackOverflowService } from '../services/stackOverflowService';
 
 /**
- * The main chat provider for the ocX assistant. It handles user requests,
- * routes them to the appropriate service (documentation, AI, etc.),
- * and streams responses back to the chat UI.
+ * The main chat provider for the ocX assistant, specialized for Red Hat OpenShift.
+ * It provides expert-level answers and tools for documentation and community searches.
  */
 export class OpenShiftChatProvider implements vscode.Disposable {
     private readonly copilotService: CopilotService;
@@ -19,7 +18,7 @@ export class OpenShiftChatProvider implements vscode.Disposable {
         this.copilotService = new CopilotService();
         this.mcpService = new MCPService(context);
         this.stackOverflowService = new StackOverflowService();
-        this.log('ocX Chat Provider initialized.');
+        this.log('ocX OpenShift Specialist Chat Provider initialized.');
     }
 
     /**
@@ -32,13 +31,20 @@ export class OpenShiftChatProvider implements vscode.Disposable {
         token: vscode.CancellationToken
     ): Promise<vscode.ChatResult> {
         try {
+            const prompt = request.prompt.trim().toLowerCase();
+
             if (request.command) {
                 return await this.handleSlashCommand(request.command, request.prompt, stream, token);
             }
-            // For general queries, defer to the AI model.
-            const prompt = `User is asking about: "${request.prompt}". Provide a helpful response.`;
-            await this.copilotService.generateStreamingResponse(prompt, stream, token);
+
+            if (prompt === 'hello' || prompt === 'hi') {
+                return this.handleGreeting(stream);
+            }
+
+            // For all other queries, provide a direct AI-driven answer.
+            await this.copilotService.generateStreamingResponse(request.prompt, stream, token);
             return {};
+
         } catch (error) {
             const message = error instanceof Error ? error.message : 'An unknown error occurred.';
             this.logError('Failed to handle request', error);
@@ -48,7 +54,7 @@ export class OpenShiftChatProvider implements vscode.Disposable {
     }
 
     /**
-     * Handles specific slash commands like /docs or /search.
+     * Handles specific slash commands for tools.
      */
     private async handleSlashCommand(
         command: string,
@@ -59,47 +65,44 @@ export class OpenShiftChatProvider implements vscode.Disposable {
         this.log(`Handling command: /${command} with prompt: "${prompt}"`);
         switch (command) {
             case 'docs':
-                return this.handleDocumentation(prompt, stream, token);
+                return this.handleDocumentation(prompt, stream);
             case 'search':
-                return this.handleStackOverflowSearch(prompt, stream, token);
+                return this.handleStackOverflowSearch(prompt, stream);
             case 'explain':
                 return this.handleExplain(stream, token);
             default:
-                stream.markdown(`Unknown command: \`/${command}\`.`);
+                stream.markdown(`Unknown command: \`/${command}\`. Valid commands are /docs, /search, and /explain.`);
                 return {};
         }
     }
+    
+    /**
+     * Responds to a greeting with a specialized welcome message.
+     */
+    private handleGreeting(stream: vscode.ChatResponseStream): vscode.ChatResult {
+        stream.markdown(`Hello! I'm **ocX**, your specialized AI assistant for Red Hat OpenShift.\n\nHere's how I can help:\n\n* **Ask me anything** about OpenShift administration or development.\n* **/docs [query]**: Fetch the latest official OpenShift documentation.\n  *Example: \`/docs create a route\`*\n* **/search [query]**: Search Stack Overflow for community solutions to errors or problems.\n  *Example: \`/search ImagePullBackOff\`*\n* **/explain**: Select an OpenShift YAML or code snippet in your editor and I'll explain it.\n\nHow can I help you today?`);
+        return {};
+    }
 
     /**
-     * Fetches and displays documentation from the MCP service.
+     * Fetches and displays documentation from the Context7 MCP service.
      */
-    private async handleDocumentation(
-        prompt: string,
-        stream: vscode.ChatResponseStream,
-        token: vscode.CancellationToken
-    ): Promise<vscode.ChatResult> {
-        const [technology, ...queryParts] = prompt.split(' ');
-        const query = queryParts.join(' ').trim();
-
-        if (!technology || !query) {
-            stream.markdown('Please provide a technology and a query for the `/docs` command.\n\n**Example:** `/docs openshift create route`');
+    private async handleDocumentation(prompt: string, stream: vscode.ChatResponseStream): Promise<vscode.ChatResult> {
+        if (!prompt) {
+            stream.markdown('Please provide a topic for the `/docs` command.');
             return {};
         }
-
-        stream.progress(`📚 Fetching documentation for "${query}" on ${technology}...`);
+        stream.progress(`📚 Fetching official OpenShift documentation for "${prompt}"...`);
         try {
-            // Correctly call getDocumentation with two arguments.
-            const docResults = await this.mcpService.getDocumentation(technology, query);
+            const docResults = await this.mcpService.getDocumentation('openshift', prompt);
             if (docResults.length === 0) {
-                stream.markdown(`No documentation found for "${query}" on ${technology}. I will ask the AI assistant for help.\n\n`);
-                const aiPrompt = `Provide documentation and examples for "${query}" related to ${technology}.`;
-                await this.copilotService.generateStreamingResponse(aiPrompt, stream, token);
+                stream.markdown(`No specific documentation found for "${prompt}".`);
                 return {};
             }
 
-            stream.markdown(`## 📖 Documentation for "${query}" on ${technology}\n\n`);
+            stream.markdown(`## 📖 OpenShift Documentation for "${prompt}"\n\n`);
             for (const doc of docResults) {
-                const snippet = doc.content.substring(0, 1500);
+                const snippet = doc.content.substring(0, 2000);
                 stream.markdown(`### ${doc.title}\n\n${snippet}...\n\n`);
                 if (doc.url) {
                     stream.markdown(`[Read More](${doc.url})\n\n---\n\n`);
@@ -107,25 +110,23 @@ export class OpenShiftChatProvider implements vscode.Disposable {
             }
         } catch (error) {
             this.logError('Documentation fetch failed', error);
-            stream.markdown(`⚠️ **Sorry, I couldn't fetch live documentation.** I'll ask the AI assistant instead.\n\n`);
-            const aiPrompt = `Provide documentation and examples for "${query}" related to ${technology}.`;
-            await this.copilotService.generateStreamingResponse(aiPrompt, stream, token);
+            stream.markdown(`⚠️ **Sorry, I couldn't fetch live documentation at this time.**`);
         }
         return {};
     }
-    
+
     /**
-     * Searches Stack Overflow for community-provided answers.
+     * Searches Stack Overflow using the dedicated MCP server.
      */
-    private async handleStackOverflowSearch(
-        prompt: string,
-        stream: vscode.ChatResponseStream,
-        token: vscode.CancellationToken
-    ): Promise<vscode.ChatResult> {
-        stream.progress(`🔍 Searching Stack Overflow for "${prompt}"...`);
+    private async handleStackOverflowSearch(prompt: string, stream: vscode.ChatResponseStream): Promise<vscode.ChatResult> {
+        if (!prompt) {
+            stream.markdown('Please provide a query or error message for the `/search` command.');
+            return {};
+        }
+        stream.progress(`🔍 Searching Stack Overflow for solutions to "${prompt}"...`);
         try {
-            const results = await this.stackOverflowService.searchQuestions(prompt, 5);
-            if (results.length === 0) {
+            const results = await this.stackOverflowService.searchOpenShiftQuestions(prompt);
+            if (!results || results.length === 0) {
                 stream.markdown('No relevant questions found on Stack Overflow.');
                 return {};
             }
@@ -136,7 +137,7 @@ export class OpenShiftChatProvider implements vscode.Disposable {
             }
         } catch (error) {
             this.logError('Stack Overflow search failed', error);
-            stream.markdown('Sorry, I was unable to search Stack Overflow at this time.');
+            stream.markdown(`⚠️ **Sorry, I was unable to search Stack Overflow at this time.**`);
         }
         return {};
     }
@@ -144,18 +145,14 @@ export class OpenShiftChatProvider implements vscode.Disposable {
     /**
      * Explains a selected code snippet using the AI model.
      */
-    private async handleExplain(
-        stream: vscode.ChatResponseStream,
-        token: vscode.CancellationToken
-    ): Promise<vscode.ChatResult> {
+    private async handleExplain(stream: vscode.ChatResponseStream, token: vscode.CancellationToken): Promise<vscode.ChatResult> {
         const selectedText = this.getSelectedText();
         if (!selectedText) {
-            stream.markdown('Please select a code snippet in your editor before using the `/explain` command.');
+            stream.markdown('Please select an OpenShift YAML or code snippet in your editor before using the `/explain` command.');
             return {};
         }
-
-        stream.progress('🧠 Explaining the selected code...');
-        const prompt = `Please explain the following code snippet:\n\n\`\`\`\n${selectedText}\n\`\`\``;
+        stream.progress('🧠 Explaining the selected OpenShift code...');
+        const prompt = `Please explain the following OpenShift-related code snippet:\n\n\`\`\`\n${selectedText}\n\`\`\``;
         await this.copilotService.generateStreamingResponse(prompt, stream, token);
         return {};
     }
@@ -176,5 +173,7 @@ export class OpenShiftChatProvider implements vscode.Disposable {
     dispose(): void {
         this.outputChannel.dispose();
         this.mcpService.dispose();
+        // The StackOverflowService does not have a dispose method as it doesn't hold persistent resources.
+        // this.stackOverflowService.dispose(); 
     }
 }

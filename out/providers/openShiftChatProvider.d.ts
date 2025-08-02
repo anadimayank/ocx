@@ -1,8 +1,7 @@
 import * as vscode from 'vscode';
 /**
- * The main chat provider for the ocX assistant. It handles user requests,
- * routes them to the appropriate service (documentation, AI, etc.),
- * and streams responses back to the chat UI.
+ * The main chat provider for the ocX assistant, specialized for Red Hat OpenShift.
+ * It provides expert-level answers and tools for documentation and community searches.
  */
 export declare class OpenShiftChatProvider implements vscode.Disposable {
     private context;
@@ -16,15 +15,19 @@ export declare class OpenShiftChatProvider implements vscode.Disposable {
      */
     handleRequest(request: vscode.ChatRequest, context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken): Promise<vscode.ChatResult>;
     /**
-     * Handles specific slash commands like /docs or /search.
+     * Handles specific slash commands for tools.
      */
     private handleSlashCommand;
     /**
-     * Fetches and displays documentation from the MCP service.
+     * Responds to a greeting with a specialized welcome message.
+     */
+    private handleGreeting;
+    /**
+     * Fetches and displays documentation from the Context7 MCP service.
      */
     private handleDocumentation;
     /**
-     * Searches Stack Overflow for community-provided answers.
+     * Searches Stack Overflow using the dedicated MCP server.
      */
     private handleStackOverflowSearch;
     /**
